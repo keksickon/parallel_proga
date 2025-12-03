@@ -51,10 +51,7 @@ $$N_x \times N_y \times N_z$$
 
 3. Для каждого порога D вычислить процент объёма (количество вокселей), получившего дозу **не меньше D**:
 
-   $$
-V(D) = \frac{\left|\{ \text{вокселей с дозой } \ge D \}\right|}
-             {N_x \cdot N_y \cdot N_z} \cdot 100\%.
-$$
+   $$V(D) = \frac{\left|\{ \text{вокселей с дозой } \ge D \}\right|} {N_x \cdot N_y \cdot N_z} \cdot 100\%.$$
 
    Примеры:
 
