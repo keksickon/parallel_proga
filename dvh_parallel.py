@@ -1,16 +1,13 @@
 import argparse
-import numpy as np
-import matplotlib.pyplot as plt
 import multiprocessing as mp
 
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 
 def read_doses_from_file(filename):
-    """
-    Считывает размеры сетки и дозы из текстового файла.
-    Формат:
-    первая строка: Nx Ny Nz
-    далее Nx*Ny*Nz чисел (по одному или по несколько в строке).
-    """
+
     with open(filename, 'r', encoding='utf-8') as f:
         first_line = f.readline().strip().split()
         if len(first_line) != 3:
@@ -19,63 +16,77 @@ def read_doses_from_file(filename):
         Nx, Ny, Nz = map(int, first_line)
         total_voxels = Nx * Ny * Nz
 
-        doses_list = []
+        doses = []
         for line in f:
             line = line.strip()
             if not line:
                 continue
             parts = line.split()
             for p in parts:
-                doses_list.append(float(p))
+                doses.append(float(p))
 
-        if len(doses_list) != total_voxels:
+        if len(doses) != total_voxels:
             raise ValueError(
                 f"Ожидалось {total_voxels} значений доз, "
-                f"а прочитано {len(doses_list)}."
+                f"а прочитано {len(doses)}."
             )
 
-    doses = np.array(doses_list, dtype=float)
     return Nx, Ny, Nz, doses
 
+def local_histogram_pure(chunk, delta_D, num_bins):
 
-def local_histogram(chunk, bin_edges):
-    hist, _ = np.histogram(chunk, bins=bin_edges)
+    hist = [0] * num_bins
+
+    for d in chunk:
+        if d < 0:
+            idx = 0
+        else:
+            idx = int(d / delta_D)
+            if idx >= num_bins:
+                idx = num_bins - 1
+        hist[idx] += 1
+
     return hist
 
+def compute_dvh_parallel_pure(doses, delta_D, n_processes=None):
 
-def compute_dvh_parallel(doses, delta_D, n_processes=None):
-    D_max = doses.max()
+    if not doses:
+        raise ValueError("Список доз пуст")
 
-    # Границы бинов: 0, ΔD, 2ΔD, ..., до значения >= D_max
-    bin_edges = np.arange(0.0, D_max + delta_D * 1.0001, delta_D)
-    if len(bin_edges) < 2:
-        raise ValueError("Слишком большой шаг ΔD: получается меньше двух бинов.")
+    D_max = max(doses)
+    if delta_D <= 0:
+        raise ValueError("ΔD должен быть > 0")
+    num_bins = int(D_max // delta_D) + 1
 
-    # Значения D соответствуют левым границам интервалов
-    D_values = bin_edges[:-1]
-
-    total_voxels = doses.size
+    total_voxels = len(doses)
 
     if n_processes is None or n_processes <= 0:
         n_processes = mp.cpu_count()
 
-    # Делим массив доз на n_processes приблизительно равных кусков
-    chunks = np.array_split(doses, n_processes)
+    chunk_size = (total_voxels + n_processes - 1) // n_processes
+    chunks = [doses[i:i + chunk_size] for i in range(0, total_voxels, chunk_size)]
 
     with mp.Pool(processes=n_processes) as pool:
-        local_hists = pool.starmap(local_histogram, [(chunk, bin_edges) for chunk in chunks])
+        local_hists = pool.starmap(
+            local_histogram_pure,
+            [(chunk, delta_D, num_bins) for chunk in chunks]
+        )
 
-    # Складываем локальные гистограммы, получаем общую
-    global_hist = np.sum(local_hists, axis=0)  # длина = len(bin_edges) - 1
+    global_hist = [0] * num_bins
+    for h in local_hists:
+        for i in range(num_bins):
+            global_hist[i] += h[i]
 
-    # Количество вокселей с дозой >= D: накопленная сумма справа налево
-    tail_counts = np.cumsum(global_hist[::-1])[::-1]
+    tail_counts = [0] * num_bins
+    running = 0
+    for i in range(num_bins - 1, -1, -1):
+        running += global_hist[i]
+        tail_counts[i] = running
 
-    # Переводим в проценты объёма
-    V_values = tail_counts / total_voxels * 100.0
+    D_values = [i * delta_D for i in range(num_bins)]
+    V_values = [tail_counts[i] / total_voxels * 100.0 for i in range(num_bins)]
 
     return D_values, V_values
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -122,17 +133,23 @@ def main():
     print(f"Файл: {args.input_file}")
     print(f"Размеры сетки: Nx={Nx}, Ny={Ny}, Nz={Nz}")
     print(f"Общее число кубиков: {total_voxels}")
-    print(f"Минимальная доза: {doses.min():.4f}")
-    print(f"Максимальная доза: {doses.max():.4f}")
+    print(f"Минимальная доза: {min(doses):.4f}")
+    print(f"Максимальная доза: {max(doses):.4f}")
     print(f"Шаг по дозе ΔD = {delta_D}")
+    if args.processes:
+        print(f"Число процессов: {args.processes}")
+    else:
+        print("Число процессов: по умолчанию (число ядер)")
 
-    D_values, V_values = compute_dvh_parallel(doses, delta_D, args.processes)
+    import time
+    t0 = time.time()
+    D_values, V_values = compute_dvh_parallel_pure(doses, delta_D, args.processes)
+    t1 = time.time()
+    print(f"\nВремя вычислений DVH (без учёта чтения файла и графика): {t1 - t0:.3f} c")
 
-    # Вывод таблицы
     lines = ["# D\tV(D)_percent"]
     for D, V in zip(D_values, V_values):
         lines.append(f"{D:.6f}\t{V:.6f}")
-
     text_table = "\n".join(lines)
 
     if args.output:
@@ -143,16 +160,17 @@ def main():
         print("\nТаблица D  V(D) (в процентах):")
         print(text_table)
 
-    # График
-    if not args.no_plot:
+    if (not args.no_plot) and (plt is not None):
         plt.figure()
         plt.plot(D_values, V_values, marker='o')
         plt.xlabel("D (доза)")
         plt.ylabel("V(D), % объёма")
-        plt.title("График зависимости доза–объём (DVH, параллельный расчёт)")
+        plt.title("DVH (без NumPy, параллельный расчёт)")
         plt.grid(True)
         plt.tight_layout()
         plt.show()
+    elif (not args.no_plot) and (plt is None):
+        print("\nmatplotlib не установлен, график построить нельзя.")
 
 
 if __name__ == "__main__":
